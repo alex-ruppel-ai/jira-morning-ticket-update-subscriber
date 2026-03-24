@@ -1,0 +1,19 @@
+# Binary
+app
+
+# Environment files
+.env
+.env.*
+*.env
+
+# IDE
+.cursor/
+
+# Platform docs
+.apps-platform-docs/
+
+# Claude local settings
+.claude/settings.local.json
+
+# Go build artifacts
+*.test

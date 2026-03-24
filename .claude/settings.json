@@ -1,0 +1,40 @@
+{
+  "enabledMcpjsonServers": [],
+   "permissions": {
+    "allow": [
+      "Bash(go *)",
+      "Bash(npm *)",
+      "Bash(apps-platform *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(echo *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(curl *)",
+      "Bash(git *)",
+      "Bash(pwd)",
+      "Bash(which *)",
+      "Bash(env *)",
+      "Bash(make *)"
+    ],
+    "deny": [
+      "Bash(rm *)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if ! make build > /dev/null 2>&1; then echo '{\"decision\": \"block\", \"reason\": \"make build failed (npm build + go build). Please fix the errors before stopping.\"}'; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

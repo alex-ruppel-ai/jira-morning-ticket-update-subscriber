@@ -1,0 +1,20 @@
+name = "jira-ticket-digest"
+enable_filestore = false
+enable_gcs_fuse = false
+enable_postgres = false
+enable_mysql = true
+enable_api_gateway = false
+enable_slack = true
+allowed_ingress_apps = ["agentic-app-builder"]
+
+[cloudrun]
+  cpu = "2"
+  memory = "2Gi"
+  gpu_count = 0
+  min_instances = 0
+  max_instances = 1
+  port = 0
+
+[metadata]
+  owner = "alex.ruppel@applied.co"
+  description = "Daily Jira ticket update bot - posts condensed and detailed Slack updates for tracked tickets"
