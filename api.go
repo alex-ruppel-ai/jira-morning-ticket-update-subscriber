@@ -1,9 +1,12 @@
 package main
 
 import (
+	"database/sql"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"slack-go-hackathon/eventlog"
 
@@ -33,7 +36,7 @@ func errorHandler() gin.HandlerFunc {
 	}
 }
 
-func registerAPIRoutes(r *gin.Engine, bot *slacklib.Bot, anaheimClient *anaheim.Client) {
+func registerAPIRoutes(r *gin.Engine, bot *slacklib.Bot, anaheimClient *anaheim.Client, db *sql.DB) {
 	api := r.Group("/api")
 	api.Use(errorHandler())
 
@@ -51,8 +54,20 @@ func registerAPIRoutes(r *gin.Engine, bot *slacklib.Bot, anaheimClient *anaheim.
 		api.POST("/anaheim/users", handleAnaheimSearchUsers(anaheimClient))
 	}
 
-	// Daily Update routes
-	api.POST("/trigger-update", handleTriggerUpdate(bot))
+	// Daily Update routes (requires MySQL)
+	if db != nil {
+		api.GET("/tickets", handleListTickets(db))
+		api.POST("/tickets", handleAddTicket(db))
+		api.DELETE("/tickets/:key", handleRemoveTicket(db))
+		api.GET("/update-config", handleGetUpdateConfig(db))
+		api.PUT("/update-config", handleSaveUpdateConfig(db))
+		api.POST("/trigger-update", handleTriggerUpdate(db, bot))
+	}
+
+	// Cron endpoint — outside /api group so Cloud Scheduler can reach it directly
+	if db != nil {
+		r.POST("/internal/jobs/check-daily-update", handleCheckDailyUpdate(db, bot))
+	}
 
 	// Data API proxy routes
 	registerDataAPIRoutes(api)
@@ -245,33 +260,211 @@ func handleGetFeedback() gin.HandlerFunc {
 
 // --- Daily Update handlers ---
 
-type triggerUpdateRequest struct {
-	JiraKey string `json:"jira_key" binding:"required"`
-	Channel string `json:"channel" binding:"required"`
+func handleListTickets(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		log.Printf("[API] GET /api/tickets")
+		tickets, err := dbGetTrackedTickets(db)
+		if err != nil {
+			log.Printf("[API] error listing tickets: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		if tickets == nil {
+			tickets = []TrackedTicket{}
+		}
+		c.JSON(http.StatusOK, gin.H{"tickets": tickets})
+	}
 }
 
-func handleTriggerUpdate(bot *slacklib.Bot) gin.HandlerFunc {
+func handleAddTicket(db *sql.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		var req triggerUpdateRequest
-		if err := c.ShouldBindJSON(&req); err != nil {
+		var body struct {
+			JiraKey string `json:"jira_key" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		log.Printf("[API] POST /api/trigger-update key=%s channel=%s", req.JiraKey, req.Channel)
+		key := strings.ToUpper(strings.TrimSpace(body.JiraKey))
+		log.Printf("[API] POST /api/tickets key=%s", key)
 
 		token := c.GetHeader("X-Request-Token")
-		if token == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Jira not connected — please connect Jira via the integration bar first"})
-			return
+		summary := key
+		if token != "" {
+			if issue, err := fetchParentIssue(token, key); err == nil {
+				summary = issue.Fields.Summary
+			} else {
+				log.Printf("[API] could not fetch Jira summary for %s: %v", key, err)
+			}
 		}
 
-		if err := runUpdate(c.Request.Context(), token, req.JiraKey, req.Channel, bot); err != nil {
-			log.Printf("[API] trigger-update error: %v", err)
+		if err := dbAddTrackedTicket(db, key, summary); err != nil {
+			log.Printf("[API] error adding ticket %s: %v", key, err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
+		// Persist token so cron can use it server-side
+		if token != "" {
+			if cfg, err := dbGetUpdateConfig(db); err == nil {
+				cfg.RequestToken = token
+				if err := dbSaveUpdateConfig(db, cfg); err != nil {
+					log.Printf("[API] warning: could not persist request token: %v", err)
+				}
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{"success": true, "jira_key": key, "summary": summary})
+	}
+}
+
+func handleRemoveTicket(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := strings.ToUpper(c.Param("key"))
+		log.Printf("[API] DELETE /api/tickets/%s", key)
+		if err := dbRemoveTrackedTicket(db, key); err != nil {
+			log.Printf("[API] error removing ticket %s: %v", key, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"success": true})
+	}
+}
+
+func handleGetUpdateConfig(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		log.Printf("[API] GET /api/update-config")
+		cfg, err := dbGetUpdateConfig(db)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		// Never expose the stored token to the frontend
+		c.JSON(http.StatusOK, gin.H{
+			"post_time": cfg.PostTime,
+			"timezone":  cfg.Timezone,
+			"channel":   cfg.Channel,
+		})
+	}
+}
+
+func handleSaveUpdateConfig(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var body struct {
+			PostTime string `json:"post_time" binding:"required"`
+			Timezone string `json:"timezone" binding:"required"`
+			Channel  string `json:"channel" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		log.Printf("[API] PUT /api/update-config time=%s tz=%s channel=%s", body.PostTime, body.Timezone, body.Channel)
+
+		existing, _ := dbGetUpdateConfig(db)
+		token := c.GetHeader("X-Request-Token")
+		if token == "" {
+			token = existing.RequestToken
+		}
+
+		cfg := UpdateConfig{
+			PostTime:     body.PostTime,
+			Timezone:     body.Timezone,
+			Channel:      body.Channel,
+			RequestToken: token,
+		}
+		if err := dbSaveUpdateConfig(db, cfg); err != nil {
+			log.Printf("[API] error saving config: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true})
+	}
+}
+
+func handleTriggerUpdate(db *sql.DB, bot *slacklib.Bot) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		log.Printf("[API] POST /api/trigger-update (manual)")
+
+		// Refresh stored token from this request if present
+		token := c.GetHeader("X-Request-Token")
+		if token != "" {
+			if cfg, err := dbGetUpdateConfig(db); err == nil {
+				cfg.RequestToken = token
+				dbSaveUpdateConfig(db, cfg)
+			}
+		}
+
+		slackTS, err := runDailyUpdate(db, bot)
+		if err != nil {
+			log.Printf("[API] trigger-update error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "slack_ts": slackTS})
+	}
+}
+
+func handleCheckDailyUpdate(db *sql.DB, bot *slacklib.Bot) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		log.Printf("[CronCheck] /internal/jobs/check-daily-update fired")
+
+		cfg, err := dbGetUpdateConfig(db)
+		if err != nil {
+			log.Printf("[CronCheck] could not load config: %v", err)
+			c.JSON(http.StatusOK, gin.H{"skipped": "config error"})
+			return
+		}
+
+		if cfg.Channel == "" || cfg.RequestToken == "" {
+			log.Printf("[CronCheck] skipping: channel=%q token_set=%v", cfg.Channel, cfg.RequestToken != "")
+			c.JSON(http.StatusOK, gin.H{"skipped": "not configured"})
+			return
+		}
+
+		alreadyPosted, err := dbHasPostedToday(db, cfg.Timezone)
+		if err != nil {
+			log.Printf("[CronCheck] could not check daily log: %v", err)
+			c.JSON(http.StatusOK, gin.H{"skipped": "log check error"})
+			return
+		}
+		if alreadyPosted {
+			log.Printf("[CronCheck] already posted today — skipping")
+			c.JSON(http.StatusOK, gin.H{"skipped": "already posted today"})
+			return
+		}
+
+		loc, err := time.LoadLocation(cfg.Timezone)
+		if err != nil {
+			loc = time.UTC
+		}
+		now := time.Now().In(loc)
+		// Parse configured post time as today's time in the configured timezone
+		var postHour, postMin int
+		fmt.Sscanf(cfg.PostTime, "%d:%d", &postHour, &postMin)
+		configuredAt := time.Date(now.Year(), now.Month(), now.Day(), postHour, postMin, 0, 0, loc)
+		// Fire if the configured time falls within the last 10 minutes
+		elapsed := now.Sub(configuredAt)
+		if elapsed < 0 || elapsed > 10*time.Minute {
+			log.Printf("[CronCheck] outside 10min window (now=%s configured=%s elapsed=%s) — skipping", now.Format("15:04"), cfg.PostTime, elapsed.Round(time.Second))
+			c.JSON(http.StatusOK, gin.H{"skipped": "not time yet"})
+			return
+		}
+
+		log.Printf("[CronCheck] within 10min window of %s (elapsed %s) — running daily update", cfg.PostTime, elapsed.Round(time.Second))
+		slackTS, err := runDailyUpdate(db, bot)
+		if err != nil {
+			log.Printf("[CronCheck] runDailyUpdate error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		if err := dbRecordDailyPost(db, slackTS, cfg.Timezone); err != nil {
+			log.Printf("[CronCheck] warning: could not record daily post: %v", err)
+		}
+
+		log.Printf("[CronCheck] daily update posted, slack_ts=%s", slackTS)
+		c.JSON(http.StatusOK, gin.H{"success": true, "slack_ts": slackTS})
 	}
 }
 

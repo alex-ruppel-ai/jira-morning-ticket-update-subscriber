@@ -55,6 +55,20 @@ func main() {
 		logger.Info("anaheim client initialized successfully")
 	}
 
+	// Initialize MySQL
+	db, err := initMySQL(context.Background())
+	if err != nil {
+		logger.Warn("failed to initialize MySQL — database features disabled",
+			zap.Error(err),
+		)
+		db = nil
+	} else {
+		if err := migrateMySQL(db); err != nil {
+			logger.Error("MySQL migration failed", zap.Error(err))
+		}
+		defer db.Close()
+	}
+
 	registerSlackHandlers(bot)
 
 	r := gin.Default()
@@ -64,7 +78,7 @@ func main() {
 	})
 
 	bot.RegisterRoutes(r.Group("/slack"))
-	registerAPIRoutes(r, bot, anaheimClient)
+	registerAPIRoutes(r, bot, anaheimClient, db)
 
 	// Serve embedded frontend
 	if os.Getenv("DEV") != "true" {
