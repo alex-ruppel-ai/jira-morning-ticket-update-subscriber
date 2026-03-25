@@ -68,6 +68,7 @@ Rules:
 	)
 
 	log.Printf("[Summarize] calling OpenAI for TL;DR (%d parents)", len(updates))
+	log.Printf("[Summarize] TL;DR prompt:\n%s", userPrompt)
 	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: openai.GPT4oMini,
 		Messages: []openai.ChatCompletionMessage{
@@ -113,6 +114,7 @@ Rules:
 	)
 
 	log.Printf("[Summarize] calling OpenAI for breakdown of %s", u.parent.Key)
+	log.Printf("[Summarize] breakdown prompt for %s:\n%s", u.parent.Key, userPrompt)
 	resp, err := client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: openai.GPT4o,
 		Messages: []openai.ChatCompletionMessage{

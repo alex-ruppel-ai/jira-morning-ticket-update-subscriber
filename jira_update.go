@@ -237,6 +237,7 @@ func fetchDescendantsRecursive(token string, issues []jiraIssue, since time.Time
 			var changelog []jiraChangelogEntry
 			// Only fetch activity for non-backlog tickets updated in the last 24h
 			status := strings.ToLower(iss.Fields.Status.Name)
+			log.Printf("[Jira] issue %s: status=%q updated=%s recentlyUpdated=%v", iss.Key, status, iss.Fields.Updated, isRecentlyUpdated(iss.Fields.Updated))
 			if isRecentlyUpdated(iss.Fields.Updated) && status != "backlog" {
 				var cwg sync.WaitGroup
 				cwg.Add(2)
@@ -251,6 +252,7 @@ func fetchDescendantsRecursive(token string, issues []jiraIssue, since time.Time
 				cwg.Wait()
 			}
 
+			log.Printf("[Jira] issue %s: fetched %d comments, %d changelog entries", iss.Key, len(comments), len(changelog))
 			subIssues, _ := fetchChildrenByJQL(token, iss.Key)
 			results[idx] = itemResult{
 				detail:    childDetail{issue: &issueCopy, comments: comments, changelog: changelog},

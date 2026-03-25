@@ -16,6 +16,7 @@ interface Config {
 const TIMEZONES = [
   { label: 'Pacific (PT)', value: 'America/Los_Angeles' },
   { label: 'Eastern (ET)', value: 'America/New_York' },
+  { label: 'Central European (CET)', value: 'Europe/Berlin' },
   { label: 'UTC', value: 'UTC' },
 ]
 
