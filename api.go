@@ -60,7 +60,7 @@ func registerAPIRoutes(r *gin.Engine, bot *slacklib.Bot, anaheimClient *anaheim.
 		api.POST("/tickets", handleAddTicket(db))
 		api.DELETE("/tickets/:key", handleRemoveTicket(db))
 		api.GET("/update-config", handleGetUpdateConfig(db))
-		api.PUT("/update-config", handleSaveUpdateConfig(db))
+		api.PUT("/update-config", handleSaveUpdateConfig(db, bot))
 		api.POST("/trigger-update", handleTriggerUpdate(db, bot))
 	}
 
@@ -348,7 +348,7 @@ func handleGetUpdateConfig(db *sql.DB) gin.HandlerFunc {
 	}
 }
 
-func handleSaveUpdateConfig(db *sql.DB) gin.HandlerFunc {
+func handleSaveUpdateConfig(db *sql.DB, bot *slacklib.Bot) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var body struct {
 			PostTime string `json:"post_time" binding:"required"`
@@ -363,8 +363,10 @@ func handleSaveUpdateConfig(db *sql.DB) gin.HandlerFunc {
 
 		existing, _ := dbGetUpdateConfig(db)
 		token := c.GetHeader("X-Request-Token")
+		log.Printf("[API] save-config: X-Request-Token present=%v", token != "")
 		if token == "" {
 			token = existing.RequestToken
+			log.Printf("[API] save-config: falling back to stored token (len=%d)", len(token))
 		}
 
 		cfg := UpdateConfig{
@@ -378,6 +380,25 @@ func handleSaveUpdateConfig(db *sql.DB) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+
+		// Auto-trigger if today's update hasn't been posted yet
+		alreadyPosted, _ := dbHasPostedToday(db, cfg.Timezone)
+		if !alreadyPosted {
+			log.Printf("[API] no post yet today — auto-triggering daily update after save")
+			go func() {
+				slackTS, err := runDailyUpdate(db, bot)
+				if err != nil {
+					log.Printf("[API] auto-trigger error: %v", err)
+					return
+				}
+				if err := dbRecordDailyPost(db, slackTS, cfg.Timezone); err != nil {
+					log.Printf("[API] warning: could not record auto-triggered post: %v", err)
+				}
+			}()
+			c.JSON(http.StatusOK, gin.H{"success": true, "triggered": true})
+			return
+		}
+
 		c.JSON(http.StatusOK, gin.H{"success": true})
 	}
 }
